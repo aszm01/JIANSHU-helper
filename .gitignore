@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# PyInstaller 构建产物
+build/
+dist/
+
+# 导出的键鼠记录（个人数据，不应入库）
+键鼠记录_*.txt
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
