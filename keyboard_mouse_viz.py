@@ -193,6 +193,13 @@ NUMPAD_DISPLAY = {
 }
 
 
+# 低级键盘钩子事件结构（区分主键盘/小键盘回车用）
+class _KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", ctypes.c_uint32), ("scanCode", ctypes.c_uint32),
+                ("flags", ctypes.c_uint32), ("time", ctypes.c_uint32),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
 def key_to_code(key):
     if isinstance(key, keyboard.Key):
         return KEY_MAP.get(key)
@@ -307,15 +314,19 @@ class KeyboardMouseViz:
         self.current_photo = ImageTk.PhotoImage(self.base_rgba)
 
         wa = self._work_area()
-        pos_x = wa[0] + wa[2] - self.img_w - 12
-        pos_y = wa[1] + wa[3] - self.img_h - 12
-        self.root.geometry("%dx%d+%d+%d" % (self.img_w, self.img_h, pos_x, pos_y))
+        # 四周 3px 纯白边框：窗口外扩 6px，画布 pack 留白露出根窗口白底
+        BORDER = 3
+        win_w = self.img_w + BORDER * 2
+        win_h = self.img_h + BORDER * 2
+        pos_x = wa[0] + wa[2] - win_w - 12
+        pos_y = wa[1] + wa[3] - win_h - 12
+        self.root.geometry("%dx%d+%d+%d" % (win_w, win_h, pos_x, pos_y))
 
         self.canvas = tk.Canvas(self.root, width=self.img_w, height=self.img_h,
                                 bg="#ffffff", highlightthickness=0, bd=0)
         self.bg_item = self.canvas.create_image(0, 0, anchor="nw", image=self.current_photo)
         self._prepare_tiles()
-        self.canvas.pack()
+        self.canvas.pack(padx=BORDER, pady=BORDER)
 
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
@@ -501,6 +512,70 @@ class KeyboardMouseViz:
         self.mouse_listener.daemon = True
         self.kb_listener.start()
         self.mouse_listener.start()
+        self._install_enter_hook()
+
+    def _install_enter_hook(self):
+        """安装低级键盘钩子，仅用于区分主键盘回车与小键盘回车。
+
+        pynput 在 Windows 上把两者都上报为 Key.enter，无法区分；低级钩子事件的
+        KBDLLHOOKSTRUCT.flags 含 LLKHF_EXTENDED(0x01)，小键盘回车带此标志。
+        """
+        self._enter_queue = []
+        try:
+            u32 = ctypes.windll.user32
+            self._kuser32 = u32
+            # 64 位系统必须声明完整签名，否则句柄被 32 位截断导致安装失败（返回 0）
+            u32.SetWindowsHookExW.restype = ctypes.c_void_p
+            u32.SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                                              ctypes.c_void_p, ctypes.c_uint32]
+            u32.CallNextHookEx.restype = ctypes.c_long
+            u32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                           ctypes.c_size_t, ctypes.c_void_p]
+            # GetModuleHandleW 在 kernel32（user32 无此导出）
+            k32 = ctypes.windll.kernel32
+            k32.GetModuleHandleW.restype = ctypes.c_void_p
+            _HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int,
+                                           ctypes.c_size_t, ctypes.c_void_p)
+            self._llhook_cb = _HOOKPROC(self._ll_hook)
+            self._enter_hook = u32.SetWindowsHookExW(
+                13, self._llhook_cb, k32.GetModuleHandleW(None), 0)
+        except Exception:
+            self._enter_hook = None
+
+    def _ll_hook(self, nCode, wParam, lParam):
+        if nCode >= 0 and wParam in (0x0100, 0x0101):  # WM_KEYDOWN / WM_KEYUP
+            try:
+                kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+                if kb.vkCode == 0x0D:  # VK_RETURN
+                    ext = bool(kb.flags & 0x01)  # LLKHF_EXTENDED -> 小键盘回车
+                    up = wParam == 0x0101
+                    self._enter_queue.append((ext, up, time.time()))
+                    if len(self._enter_queue) > 8:
+                        self._enter_queue.pop(0)
+            except Exception:
+                pass
+        try:
+            return self._kuser32.CallNextHookEx(self._enter_hook, nCode, wParam, lParam)
+        except Exception:
+            return 0
+    def _enter_code(self):
+        """取出最近一次回车事件：扩展键（小键盘）返回 NumpadEnter，否则 Enter。"""
+        now = time.time()
+        while self._enter_queue and now - self._enter_queue[0][2] > 0.1:
+            self._enter_queue.pop(0)
+        if self._enter_queue:
+            ext, _up, _ts = self._enter_queue.pop(0)
+            return "NumpadEnter" if ext else "Enter"
+        return "Enter"
+
+    def _key_info(self, key):
+        """返回 (code, display)。回车做扩展键区分，其余走既有映射。"""
+        code = key_to_code(key)
+        disp = key_to_display(key)
+        if key is keyboard.Key.enter:
+            code = self._enter_code()
+            disp = "小键盘回车" if code == "NumpadEnter" else "Enter"
+        return code, disp
 
     def _on_key_press(self, key):
         if isinstance(key, keyboard.KeyCode) and key.char == "*":
@@ -513,17 +588,17 @@ class KeyboardMouseViz:
                 self._after(0, self.toggle_recording)
                 return
         self.pressed.add(key)
-        code = key_to_code(key)
+        code, disp = self._key_info(key)
         self.event_queue.put(("key_press", code))
         if self.is_recording and code not in (None, "CapsLock", "NumLock"):
-            self._record("keyboard", "press", key=key_to_display(key), code=code)
+            self._record("keyboard", "press", key=disp, code=code)
 
     def _on_key_release(self, key):
         self.pressed.discard(key)
-        code = key_to_code(key)
+        code, disp = self._key_info(key)
         self.event_queue.put(("key_release", code))
         if self.is_recording and code not in (None, "CapsLock", "NumLock"):
-            self._record("keyboard", "release", key=key_to_display(key), code=code)
+            self._record("keyboard", "release", key=disp, code=code)
 
     def _on_mouse_click(self, x, y, button, pressed):
         btn = self._btn_index(button)
