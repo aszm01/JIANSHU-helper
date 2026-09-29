@@ -531,7 +531,6 @@ class KeyboardMouseViz:
 
         raw = img.tobytes()
         # C 级向量 premultiply（替代 Python 逐像素循环，避免卡顿）：
-        # 拆 R,G,B,A -> 各自乘 alpha/255 -> 以 B,G,R,A 顺序重组，得 premultiplied BGRA
         r, g, b, a = img.split()
         r = ImageChops.multiply(r, a)
         g = ImageChops.multiply(g, a)
@@ -607,7 +606,7 @@ class KeyboardMouseViz:
         drag = tk.Canvas(win, width=self.SET_WIN_W, height=self.SET_WIN_H,
                          bg="#ffffff", highlightthickness=0, bd=0)
         drag.place(x=0, y=0)
-        drag.tk.call("lower", drag._w)  # Canvas.lower 被图元方法占用，走底层整体降级
+        drag.tk.call("lower", drag._w)
         self.drag_bg = drag
         self.title_lbl = tk.Label(win, text="背景透明度", bg="#ffffff", fg="#333333",
                                   font=font)
@@ -631,8 +630,6 @@ class KeyboardMouseViz:
                                              self.pos_fixed,
                                              lambda: self._set_pos_fixed(not self.pos_fixed))
 
-        # 拖动：只在底层拖动画布 / 标题 / 百分比上绑定；
-        # 关键：不在 Toplevel(win) 上绑定，否则滑块等子控件会经 bindtag 连带触发。
         self._sd_off = None
         for wgt in (drag, self.title_lbl, self.alpha_pct):
             wgt.bind("<Button-1>", self._sd_start)
@@ -745,6 +742,16 @@ class KeyboardMouseViz:
                 getattr(self, s).stop()
             except Exception:
                 pass
+        # 关闭时卸载键盘低级钩子，避免进程残留
+        try:
+            if getattr(self, "_enter_hook", None):
+                u32 = self.u32
+                u32.UnhookWindowsHookEx.restype = ctypes.c_int
+                u32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+                u32.UnhookWindowsHookEx(self._enter_hook)
+                self._enter_hook = None
+        except Exception:
+            pass
         for tid in list(self._after_ids):
             try:
                 self.root.after_cancel(tid)
@@ -915,7 +922,6 @@ class KeyboardMouseViz:
         self.mouse_pos = (x, y)
         if self.click_through:
             return
-        # 计算悬停热区（仅在窗口范围内）
         tag = None
         if (self.win_x <= x <= self.win_x + self.win_w
                 and self.win_y <= y <= self.win_y + self.win_h):
@@ -1025,7 +1031,6 @@ class KeyboardMouseViz:
         if self._lock_tick % 20 == 0:
             self._refresh_lock_states()
 
-        # notice 过期重绘
         if self.notice_text and time.time() >= self.notice_until:
             self.notice_text = ""
             self._render()
