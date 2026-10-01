@@ -531,6 +531,7 @@ class KeyboardMouseViz:
 
         raw = img.tobytes()
         # C 级向量 premultiply（替代 Python 逐像素循环，避免卡顿）：
+        # 拆 R,G,B,A -> 各自乘 alpha/255 -> 以 B,G,R,A 顺序重组，得 premultiplied BGRA
         r, g, b, a = img.split()
         r = ImageChops.multiply(r, a)
         g = ImageChops.multiply(g, a)
@@ -606,7 +607,7 @@ class KeyboardMouseViz:
         drag = tk.Canvas(win, width=self.SET_WIN_W, height=self.SET_WIN_H,
                          bg="#ffffff", highlightthickness=0, bd=0)
         drag.place(x=0, y=0)
-        drag.tk.call("lower", drag._w)
+        drag.tk.call("lower", drag._w)  # Canvas.lower 被图元方法占用，走底层整体降级
         self.drag_bg = drag
         self.title_lbl = tk.Label(win, text="背景透明度", bg="#ffffff", fg="#333333",
                                   font=font)
@@ -630,6 +631,8 @@ class KeyboardMouseViz:
                                              self.pos_fixed,
                                              lambda: self._set_pos_fixed(not self.pos_fixed))
 
+        # 拖动：只在底层拖动画布 / 标题 / 百分比上绑定；
+        # 关键：不在 Toplevel(win) 上绑定，否则滑块等子控件会经 bindtag 连带触发。
         self._sd_off = None
         for wgt in (drag, self.title_lbl, self.alpha_pct):
             wgt.bind("<Button-1>", self._sd_start)
@@ -666,6 +669,11 @@ class KeyboardMouseViz:
 
     def _set_click_through(self, on):
         self.click_through = on
+        if on:
+            # 鼠标穿透时窗口必然无法拖动 => 自动点亮“位置固定”
+            if not self.pos_fixed:
+                self.pos_fixed = True
+                self._toggle_draw(self.fix_btn, self.fix_btn.text, True)
         self._toggle_draw(self.ct_btn, self.ct_btn.text, on)
         ex = self.u32.GetWindowLongW(self.hwnd, -20)
         if on:
@@ -677,6 +685,15 @@ class KeyboardMouseViz:
                               0x0001 | 0x0002 | 0x0020 | 0x0010)
 
     def _set_pos_fixed(self, on):
+        if not on and self.click_through:
+            # 关闭“位置固定”时，若鼠标穿透仍开启则一并关闭（穿透依赖固定）
+            self.click_through = False
+            self._toggle_draw(self.ct_btn, self.ct_btn.text, False)
+            ex = self.u32.GetWindowLongW(self.hwnd, -20)
+            ex &= ~0x20
+            self.u32.SetWindowLongW(self.hwnd, -20, ex)
+            self.u32.SetWindowPos(self.hwnd, 0, 0, 0, 0, 0,
+                                  0x0001 | 0x0002 | 0x0020 | 0x0010)
         self.pos_fixed = on
         self._toggle_draw(self.fix_btn, self.fix_btn.text, on)
 
@@ -922,6 +939,7 @@ class KeyboardMouseViz:
         self.mouse_pos = (x, y)
         if self.click_through:
             return
+        # 计算悬停热区（仅在窗口范围内）
         tag = None
         if (self.win_x <= x <= self.win_x + self.win_w
                 and self.win_y <= y <= self.win_y + self.win_h):
@@ -1031,6 +1049,7 @@ class KeyboardMouseViz:
         if self._lock_tick % 20 == 0:
             self._refresh_lock_states()
 
+        # notice 过期重绘
         if self.notice_text and time.time() >= self.notice_until:
             self.notice_text = ""
             self._render()
