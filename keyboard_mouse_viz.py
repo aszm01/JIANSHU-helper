@@ -19,7 +19,7 @@
   交互：pynput 全局鼠标钩子按屏幕坐标路由热区（按钮/cog/关闭/拖动），与窗口样式无关。
   鼠标穿透：主窗加 WS_EX_TRANSPARENT（点击全穿过），全局钩子仍只放行 cog。
   位置固定：路由层禁止拖动。
-依赖：pynput, pillow, resvg-py
+依赖：pynput, pillow, resvg-py, pystray
 """
 
 import os
@@ -32,7 +32,7 @@ import ctypes.wintypes
 
 import tkinter as tk
 
-from PIL import Image, ImageDraw, ImageFont, ImageChops
+from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageTk, ImageOps
 
 from pynput import keyboard, mouse
 
@@ -264,6 +264,15 @@ class KeyboardMouseViz:
         self.u32.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
                                            ctypes.c_void_p, ctypes.c_void_p]
 
+        # 单实例：已有实例运行时，通知它显示悬浮窗后退出
+        self._external_show = False
+        _mutex = self.k32.CreateMutexW(None, False, "Global\\jianshu_helper_mutex")
+        if self.k32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            _hwnd = self.u32.FindWindowW("KbMouseVizCls", None)
+            if _hwnd:
+                self.u32.SendMessageW(_hwnd, 0x0400 + 1, 0, 0)  # WM_USER+1
+            sys.exit(0)
+
         # 隐藏 Tk root：只做消息泵 / after 定时 / 设置窗父
         self.root = tk.Tk()
         self.root.title("录屏键鼠助手")
@@ -304,6 +313,7 @@ class KeyboardMouseViz:
         self._refresh_lock_states()
         self._render()
         self._after(15, self._poll_events)
+        self._setup_tray()
         try:
             self.root.mainloop()
         except Exception:
@@ -422,12 +432,14 @@ class KeyboardMouseViz:
         self.u32.RegisterClassW(ctypes.byref(self._wc))
 
         self.hwnd = self.u32.CreateWindowExW(
-            0x80000 | 0x8, "KbMouseVizCls", "录屏键鼠助手", 0x80000000,
+            0x80000 | 0x8 | 0x80, "KbMouseVizCls", "录屏键鼠助手", 0x80000000,
             self.win_x, self.win_y, self.win_w, self.win_h,
             0, 0, self._hinst, 0)
         self.u32.ShowWindow(self.hwnd, 5)
 
     def _wndproc(self, h, m, w, l):
+        if m == 0x0400 + 1:  # WM_USER+1：外部请求显示悬浮窗
+            self._external_show = True
         return self.u32.DefWindowProcW(h, m, w, l)
 
     # ------------------------------------------------------------ 渲染合成
@@ -438,7 +450,7 @@ class KeyboardMouseViz:
 
         # 1) 背景矩形：整块白色，alpha 由滑块控制
         a = int(round(self.bg_alpha * 255))
-        d.rectangle([0, 0, W - 1, H - 1], fill=(255, 255, 255, a))
+        d.rounded_rectangle([0, 0, W - 1, H - 1], radius=max(3, int(H * 0.035)), fill=(255, 255, 255, a))
 
         # 2) 绿色按键指示（内容区偏移 BORDER）
         for code in self.lit:
@@ -469,21 +481,21 @@ class KeyboardMouseViz:
         # 开始 / 录制
         x1, y1, x2, y2 = self._pos_rect(BTN_START)
         col = (67, 160, 71) if self.is_recording else (244, 67, 54)
-        d.rounded_rectangle([x1, y1, x2, y2], radius=min(8, (y2 - y1) // 2), fill=col)
+        d.rounded_rectangle([x1, y1, x2, y2], radius=max(3, int((y2 - y1) * 0.25)), fill=col)
         self._center_text(d, (x1 + x2) // 2, (y1 + y2) // 2,
                           "录制" if self.is_recording else "开始", self.btn_font)
 
         # 下载
         if self.dl_visible:
             x1, y1, x2, y2 = self._pos_rect(BTN_DOWNLOAD)
-            d.rounded_rectangle([x1, y1, x2, y2], radius=min(8, (y2 - y1) // 2),
+            d.rounded_rectangle([x1, y1, x2, y2], radius=max(3, int((y2 - y1) * 0.25)),
                                 fill=(33, 150, 243))
             self._center_text(d, (x1 + x2) // 2, (y1 + y2) // 2, "下载", self.btn_font)
 
         # notice
         if self.notice_text and time.time() < self.notice_until:
             x1, y1, x2, y2 = self._pos_rect(NOTICE)
-            d.rounded_rectangle([x1, y1, x2, y2], radius=min(8, (y2 - y1) // 2),
+            d.rounded_rectangle([x1, y1, x2, y2], radius=max(3, int((y2 - y1) * 0.25)),
                                 fill=(76, 175, 80))
             self._center_text(d, (x1 + x2) // 2, (y1 + y2) // 2,
                               self.notice_text, self.notice_font)
@@ -556,6 +568,58 @@ class KeyboardMouseViz:
         self.u32.SetWindowPos(self.hwnd, 0, x, y, 0, 0,
                               0x0001 | 0x0010)  # NOSIZE | NOACTIVATE
 
+    # ------------------------------------------------------------ 系统托盘
+    def _setup_tray(self):
+        import threading
+        import pystray
+        self._hidden = False
+        def on_toggle(icon, item):
+            self.root.after(0, self._show_if_hidden)
+        def on_record(icon, item):
+            self.root.after(0, self.toggle_recording)
+        def on_quit(icon, item):
+            self.root.after(0, self._shutdown)
+        try:
+            color_img = Image.open(resource_path("logo.ico")).convert("RGBA")
+        except Exception:
+            color_img = Image.new("RGBA", (64, 64), (60, 90, 160, 255))
+        # 灰度版（未录制）
+        gray_img = ImageOps.grayscale(color_img).convert("RGBA")
+        self._tray_icons = {"on": color_img, "off": gray_img}
+        self.tray_icon = pystray.Icon(
+            "jianshu", gray_img, "录屏键鼠助手（未录制）",
+            menu=pystray.Menu(
+                pystray.MenuItem("显示悬浮窗", on_toggle, default=True),
+                pystray.MenuItem("开始/停止录制", on_record),
+                pystray.MenuItem("下载记录",
+                                 lambda icon, item: self.root.after(0, self.export_record),
+                                 enabled=lambda item: len(self.records) > 0),
+                pystray.MenuItem("退出", on_quit),
+            ))
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def _toggle_visibility(self):
+        if self._hidden:
+            self.u32.ShowWindow(self.hwnd, 5)
+            self._hidden = False
+        else:
+            self.u32.ShowWindow(self.hwnd, 0)
+            self._hidden = True
+
+    def _hide_to_tray(self):
+        try:
+            self._close_settings()
+        except Exception:
+            pass
+        if not self._hidden:
+            self.u32.ShowWindow(self.hwnd, 0)
+            self._hidden = True
+
+    def _show_if_hidden(self):
+        if self._hidden:
+            self.u32.ShowWindow(self.hwnd, 5)
+            self._hidden = False
+
     # ------------------------------------------------------------ 设置窗口
     SET_WIN_W = 260
     SET_WIN_H = 120
@@ -580,6 +644,11 @@ class KeyboardMouseViz:
         win.attributes("-topmost", True)
         win.configure(bg="#ffffff")
         win.geometry("%dx%d+%d+%d" % (w, h, sx, sy))
+        # 设置窗口整体圆角（Win32 区域裁剪）
+        _hwnd = int(win.winfo_id())
+        _r = max(4, int(h * 0.035))
+        _rgn = ctypes.windll.gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, _r * 2, _r * 2)
+        ctypes.windll.user32.SetWindowRgn(_hwnd, _rgn, True)
 
         side = 28
         xcv = tk.Canvas(win, width=side, height=side, bg="#ffffff",
@@ -663,7 +732,11 @@ class KeyboardMouseViz:
         b.delete("all")
         bg = "#4CAF50" if on else "#e0e0e0"
         fg = "#ffffff" if on else "#333333"
-        b.create_rectangle(0, 0, 106, 34, fill=bg, outline="")
+        btn = Image.new("RGBA", (106, 34), (0, 0, 0, 0))
+        ImageDraw.Draw(btn).rounded_rectangle(
+            [0, 0, 105, 33], radius=max(3, int(34 * 0.25)), fill=bg)
+        b.imgtk = ImageTk.PhotoImage(btn)
+        b.create_image(0, 0, anchor="nw", image=b.imgtk)
         b.create_text(53, 17, text=text, fill=fg,
                       font=("Microsoft YaHei", 10, "bold"))
 
@@ -750,6 +823,10 @@ class KeyboardMouseViz:
         return tid
 
     def _shutdown(self):
+        try:
+            self.tray_icon.stop()
+        except Exception:
+            pass
         try:
             self._close_settings()
         except Exception:
@@ -850,7 +927,7 @@ class KeyboardMouseViz:
         return code, disp
 
     def _on_key_press(self, key):
-        if isinstance(key, keyboard.KeyCode) and key.char == "*":
+        if isinstance(keyboard.KeyCode) and key.char == "*":
             if any(k in self.pressed for k in _ALT_KEYS):
                 self._after(0, self.toggle_recording)
                 return
@@ -931,7 +1008,7 @@ class KeyboardMouseViz:
         elif name == "download":
             self._after(0, self.export_record)
         elif name == "close":
-            self._after(0, self._shutdown)
+            self._after(0, self._hide_to_tray)
         elif name == "cog":
             self._after(0, self._toggle_settings)
 
@@ -982,7 +1059,21 @@ class KeyboardMouseViz:
         else:
             self.is_recording = False
             self.dl_visible = True
+        self._update_tray_icon()
         self._render()
+
+    def _update_tray_icon(self):
+        if not hasattr(self, "tray_icon"):
+            return
+        try:
+            if self.is_recording:
+                self.tray_icon.icon = self._tray_icons["on"]
+                self.tray_icon.title = "录屏键鼠助手（录制中）"
+            else:
+                self.tray_icon.icon = self._tray_icons["off"]
+                self.tray_icon.title = "录屏键鼠助手（未录制）"
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ 导出
     def export_record(self):
@@ -1023,6 +1114,9 @@ class KeyboardMouseViz:
 
     # ------------------------------------------------------------ 可视化
     def _poll_events(self):
+        if self._external_show:
+            self._external_show = False
+            self._show_if_hidden()
         try:
             while True:
                 evt = self.event_queue.get_nowait()
